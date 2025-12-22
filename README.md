@@ -1,62 +1,76 @@
-TD42Tacho V3.6.1 RELEASE — Feature list
-Core gauge
+# TD42Tacho — V3.6.1 RELEASE
 
-VR RPM input with smoothing + stable RPM display
+ESP32-based tachometer + boost gauge for TD42 (and similar setups), with OLED display, web configuration, and firmware update support.
 
-OLED bar/graph display modes (RPM / Boost)
+## What’s new in V3.6.1 RELEASE
+- Service Mode (4× power-cycle trigger) + 10 minute timeout
+- Wi-Fi is OFF in normal driving mode (faster + more stable)
+- On-screen **SERVICE** indicator flashes when Service Mode is active
+- Boost graph bottom row: **RPM (left)** + **PSI (right)** in matching font
+- Independent RPM/PSI flashing; if both flash at once they flash opposite
+- Update/config pages cleaned (no weird encoding characters)
+- ESP32 Arduino core v3 compatible
 
-Boost display with PSI readout
+---
 
-Peak/Trip tracking (max RPM trip, trip km) + reset buttons from web UI
+## Hardware
+- ESP32 (tested with standard ESP32 Dev Module / WROOM-class boards)
+- OLED (U8g2 supported; typical 128×64 I2C OLED)
+- VR conditioner / VR sensor input (RPM)
+- Optional speed pulse input
 
-Engine hours counting (only above a running RPM threshold)
+> Pin mapping and wiring depends on your exact VR conditioner and OLED type. Check the defines at the top of the `.ino`.
 
-Display/UI
+---
 
-Boost graph bottom row shows RPM (left) and PSI (right) (same font size)
+## Build environment
+- Arduino IDE
+- ESP32 board package (Arduino-ESP32 core v3 supported)
+- Libraries used:
+  - U8g2
+  - WiFi / WebServer (built-in with ESP32 core)
+  - Preferences (NVS)
+  - HTTPClient + Update (for manifest-based flashing)
+  - ArduinoOTA (used in Service Mode only)
 
-RPM and PSI flashing are independent
+---
 
-If both flashes are active at once, they flash opposite each other (RPM on while PSI off, then swap)
+## Wi-Fi behavior (important)
+### Normal Mode (default)
+- Wi-Fi is **OFF**
+- Gauge runs fastest/cleanest for driving
 
-Boot/logo display holds for ~2 seconds (less “blink and miss it”)
+### Service Mode
+Service Mode enables hotspot + web UI + update tools for a limited time.
 
-SERVICE indicator flashes on-screen when Service Mode is active
+**Enter Service Mode:**
+1. Power ON/OFF the gauge **4 times** (quickly)
+2. On the 4th boot it enables Service Mode
 
-Wi-Fi & Service Mode
+**What you’ll see:**
+- OLED flashes **SERVICE**
+- Hotspot appears: `td42tach`
+- Service Mode lasts **10 minutes**, then Wi-Fi shuts down automatically
 
-Normal running: Wi-Fi OFF (fastest/stablest driving mode)
+---
 
-Service Mode: enter by 4× power cycles within the boot window
+## Web UI
+Connect to the hotspot and open:
+- `http://192.168.4.1/` (dashboard)
+- `http://192.168.4.1/config` (configuration)
+- `http://192.168.4.1/update` (firmware updates)
 
-Service Mode starts AP hotspot (SSID td42tach) + web UI + update tools
+---
 
-Auto-timeout: Service Mode shuts down after 10 minutes and returns to Wi-Fi OFF
+## Firmware updates via GitHub (Manifest method)
+This firmware supports updating from a **manifest.json** hosted on GitHub (raw or release asset).
 
-Web UI (config + updates)
+### Manifest format
+Create a JSON file like this:
 
-Config page for tuning gauge behavior (bar RPM, redline, graph mode, etc.)
-
-STA connect/disconnect for internet access when doing updates
-
-Firmware update system using a manifest URL (great for GitHub hosting)
-
-Live status polling endpoints for STA connection status
-
-TD42Tacho V3.6.1 RELEASE — Bugfix report / changes
-
-Fixed ESP32 core v3 compile break: WiFi.setAutoConnect() removed → handled safely (core v3 compatible).
-
-Fixed STA connect lock/stall: prevents “wifi:sta is connecting, cannot set config” by disconnecting cleanly before applying new STA config.
-
-Fixed update status endpoint build issue: removed the extern vs static function mismatch for routeUpdateStatus().
-
-Removed weird web-page characters caused by encoding/emoji/unicode; replaced with plain ASCII and enforced proper page charset.
-
-Improved “Connected / Connecting…” reporting for update flow (status polling + cache busting).
-
-Added 2-second boot/logo hold for nicer startup UX.
-
-Added on-screen SERVICE indicator so you can confirm Service Mode without Serial Monitor.
-
-Kept update features available only during Service Mode (normal driving stays lightweight).
+```json
+{
+  "version": "3.6.1",
+  "bin_url": "https://YOUR_HOSTED_URL/TD42Tacho_V3_6_1.bin",
+  "notes": "Optional release notes here"
+}
