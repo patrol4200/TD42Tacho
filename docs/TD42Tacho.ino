@@ -54,8 +54,8 @@ bool bootFinished = false;
 struct ServiceItem;
 
 /* ================== PINS ================== */
-#define PIN_VR_RPM     34   // OUT1 from MAX9926 (cam VR)
-#define PIN_VR_SPEED   35   // OUT2 from MAX9926 (t-case speed VR)
+#define PIN_VR_RPM     35   // OUT1 from MAX9926 (cam VR)
+#define PIN_VR_SPEED   34   // OUT2 from MAX9926 (t-case speed VR)
 
 // SPI OLED pins (your screen: GND VCC CLK MOS RES DC CS)
 #define OLED_SCK   18
@@ -486,6 +486,107 @@ Preferences prefs;
 static float engineRpmPerHz = 120.0f; // computed from cam triggers
 static int   camTriggersPerCamRev = 1; // 1 = single-tooth cam, 6 = many Nissan wheels
 static int   rpmEdgeMode = 0; // 0=FALLING (recommended), 1=RISING
+
+// -------- FACTORY DASH TACH OUT (GU TB45 cluster) --------
+// Output is OPEN-COLLECTOR style via an external transistor:
+// GPIO -> 1k -> NPN base, NPN emitter -> GND, NPN collector -> dash tacho wire (cluster pull-up ~5-6V)
+// IMPORTANT: Do NOT drive the dash wire high directly.
+
+static const int PIN_TACH_OUT = 25;
+
+static bool  dashTachEnabled   = false;
+static float dashPulsesPerRev  = 3.0f;   // starting point; tune to match cluster
+static int   dashCalPct        = 100;    // 100 = no correction
+static bool  dashForceTest     = false;  // Option A: fixed Hz output for testing
+static float dashForceHz       = 80.0f;  // fixed Hz when dashForceTest is enabled
+static bool  dashHammerMode   = false;   // runtime-only: force output LOW continuously (for wiring test)
+
+// Internal state for Nissan-style open-collector pulse generator
+// IMPORTANT for 2N7000 low-side switch:
+//   GPIO HIGH  -> MOSFET ON  -> pulls dash line LOW
+//   GPIO LOW   -> MOSFET OFF -> dash line floats HIGH via cluster pull-up (~5-6V)
+//
+// Many Nissan clusters prefer short LOW pulses (open-collector) rather than a 50% duty square wave.
+static uint32_t dashNextEdgeUs   = 0;     // time of next state change
+static uint32_t dashPeriodUs     = 0;     // full period in microseconds
+static uint32_t dashPulseLowUs   = 1500;  // LOW pulse width in microseconds (tunable)
+static bool     dashPulseActive  = false; // true while we're holding the line LOW
+
+static inline float dashCalcHzFromRpm(float rpm) {
+  if (dashForceTest) return dashForceHz;
+  float cal = (float)dashCalPct / 100.0f;
+  float hz = (rpm / 60.0f) * dashPulsesPerRev * cal;
+  return hz;
+}
+
+static void dashTachInit() {
+  pinMode(PIN_TACH_OUT, OUTPUT);
+  // OFF = MOSFET OFF = line floats HIGH (do not drive high!)
+  digitalWrite(PIN_TACH_OUT, LOW);
+  dashNextEdgeUs  = micros();
+  dashPeriodUs    = 0;
+  dashPulseActive = false;
+}
+
+// Call every loop. Non-blocking.
+static void dashTachService(float rpmNow) {
+  if (dashHammerMode) {
+    // Force the line LOW continuously (MOSFET ON). Useful to prove wiring/cluster input.
+    digitalWrite(PIN_TACH_OUT, HIGH);
+    dashPulseActive = false;
+    dashNextEdgeUs = micros() + 1000000UL;
+    return;
+  }
+  // Default safe state: MOSFET OFF (line released high by cluster pull-up)
+  if (!dashTachEnabled) {
+    digitalWrite(PIN_TACH_OUT, LOW);
+    dashPeriodUs = 0;
+    dashPulseActive = false;
+    return;
+  }
+
+  float hz = dashCalcHzFromRpm(rpmNow);
+
+  // Stop output below ~2 Hz (prevents "fake idle" / stuck needle)
+  if (hz < 2.0f) {
+    digitalWrite(PIN_TACH_OUT, LOW);
+    dashPeriodUs = 0;
+    dashPulseActive = false;
+    return;
+  }
+
+  // Clamp to sane max
+  if (hz > 2000.0f) hz = 2000.0f;
+
+  uint32_t newPeriod = (uint32_t)(1000000.0f / hz);
+  if (newPeriod < 200) newPeriod = 200; // safety clamp
+
+  dashPeriodUs = newPeriod;
+
+  // Make sure pulse width never exceeds ~40% of the period (keeps it "short")
+  uint32_t pw = dashPulseLowUs;
+  uint32_t maxPw = dashPeriodUs / 2; // hard limit
+  if (pw < 150) pw = 150;           // avoid too-short pulses
+  if (pw > maxPw) pw = maxPw;
+
+  uint32_t now = micros();
+  if ((int32_t)(now - dashNextEdgeUs) < 0) return;
+
+  if (!dashPulseActive) {
+    // Start LOW pulse: pull line down
+    digitalWrite(PIN_TACH_OUT, HIGH);      // MOSFET ON (pull LOW)
+    dashPulseActive = true;
+    dashNextEdgeUs = now + pw;
+  } else {
+    // End LOW pulse: release line
+    digitalWrite(PIN_TACH_OUT, LOW);       // MOSFET OFF (float HIGH)
+    dashPulseActive = false;
+    // Schedule next pulse start
+    uint32_t rest = (dashPeriodUs > pw) ? (dashPeriodUs - pw) : 1;
+    dashNextEdgeUs = now + rest;
+  }
+}
+
 volatile uint32_t rpmMinPeriodUs = 0; // noise filter (ignore pulses faster than this)
 
 
@@ -852,6 +953,19 @@ void loadAll() {
 
   diag.boostSweepEnabled = prefs.getBool("bs", diag.boostSweepEnabled);
 
+  // RPM input settings
+  camTriggersPerCamRev = prefs.getInt("camT", camTriggersPerCamRev);
+  rpmEdgeMode          = prefs.getInt("edge", rpmEdgeMode);
+
+  // Factory dash tach out
+  dashTachEnabled  = prefs.getBool("dt_en", dashTachEnabled);
+  dashPulsesPerRev = prefs.getFloat("dt_ppr", dashPulsesPerRev);
+  dashCalPct       = prefs.getInt("dt_cal", dashCalPct);
+  dashForceTest    = prefs.getBool("dt_ft", dashForceTest);
+  dashForceHz      = prefs.getFloat("dt_fh", dashForceHz);
+  dashPulseLowUs   = (uint32_t)prefs.getInt("dt_pw", (int)dashPulseLowUs);
+
+
   ui.graphMode = prefs.getInt("gm", ui.graphMode);
   boost.vZero = prefs.getFloat("bz_v0", boost.vZero);
   boost.vMax  = prefs.getFloat("bz_vm", boost.vMax);
@@ -949,6 +1063,18 @@ void saveSpeedCfg() {
   prefs.end();
 }
 
+void saveDashCfg() {
+  prefs.begin("td42tach", false);
+  prefs.putBool("dt_en", dashTachEnabled);
+  prefs.putFloat("dt_ppr", dashPulsesPerRev);
+  prefs.putInt("dt_cal", dashCalPct);
+  prefs.putBool("dt_ft", dashForceTest);
+  prefs.putFloat("dt_fh", dashForceHz);
+  prefs.putInt("dt_pw", (int)dashPulseLowUs);
+  prefs.end();
+}
+
+
 void saveUi() {
   prefs.begin("td42tach", false);
   prefs.putInt("barMin", ui.barMinRpm);
@@ -961,6 +1087,14 @@ void saveUi() {
   prefs.putInt("red", ui.redlineRpm);
   prefs.putInt("camT", camTriggersPerCamRev);
   prefs.putInt("edge", rpmEdgeMode);
+
+  // Factory dash tach out
+  prefs.putBool("dt_en", dashTachEnabled);
+  prefs.putFloat("dt_ppr", dashPulsesPerRev);
+  prefs.putInt("dt_cal", dashCalPct);
+  prefs.putBool("dt_ft", dashForceTest);
+  prefs.putFloat("dt_fh", dashForceHz);
+
   prefs.putInt("gm", ui.graphMode);
   prefs.putFloat("bz_v0", boost.vZero);
   prefs.putFloat("bz_vm", boost.vMax);
@@ -1398,6 +1532,29 @@ void routeConfig() {
   s += "<div class='row'>Pulses per KM: <input name='ppkm' type='number' step='1' value='" + fmt1(spd.pulsesPerKm) + "'></div>";
   s += "<button type='submit'>Save Speed</button></form></div>";
 
+
+  // ---- Factory Dash Tach Out ----
+  s += "<div class='card'><b>Factory Dash Tach Out (GU TB45)</b><br>"
+       "<small>Use an external transistor (open-collector). Cluster provides pull-up (~5–8V). "
+       "Never drive the vehicle wire high. This output only pulls LOW.</small>";
+  s += "<form action='/setDash' method='post'>";
+  s += "<div class='row'><label><input type='checkbox' name='dt_en' " + String(dashTachEnabled ? "checked" : "") + "> Enable dash tacho output</label></div>";
+  s += "<div class='row'>Pulses per Rev: <input name='dt_ppr' type='number' min='0.1' max='24' step='0.1' value='" + String(dashPulsesPerRev, 1) + "'></div>";
+  s += "<div class='row'>Dash Cal (%): <input name='dt_cal' type='number' min='50' max='150' step='1' value='" + String(dashCalPct) + "'> <small>(if dash reads low, increase)</small></div>";
+  s += "<hr><b>Test Mode (Option A)</b><br><small>Outputs a fixed frequency so the dash holds a steady RPM (for wiring/debug).</small>";
+  s += "<div class='row'><label><input type='checkbox' name='dt_ft' " + String(dashForceTest ? "checked" : "") + "> Enable fixed Hz test</label></div>";
+  s += "<div class='row'>Fixed Hz: <input name='dt_fh' type='number' min='2' max='2000' step='1' value='" + String((int)dashForceHz) + "'></div>";
+  s += "<div class='row'>Pulse LOW width (us): <input name='dt_pw' type='number' min='150' max='5000' step='10' value='" + String((int)dashPulseLowUs) + "'></div>";
+  s += "<div class='row'><button class='btn' type='submit'>Save Dash</button></div>";
+  s += "</form>";
+  // Hammer test (runtime only)
+  s += "<hr><b>Hammer test</b> <small>(runtime only)</small><br><small>Forces the output to pull LOW continuously. Useful to prove wiring/cluster input. Turn OFF before driving.</small>";
+  s += "<div class='row'><form method='post' action='/dashHammer' style='display:inline-block;margin-right:8px'>"
+       "<input type='hidden' name='on' value='1'><button class='btn' type='submit'>HAMMER ON</button></form>"
+       "<form method='post' action='/dashHammer' style='display:inline-block'>"
+       "<input type='hidden' name='off' value='1'><button class='btn' type='submit'>HAMMER OFF</button></form>"
+       "<span style='margin-left:10px'>State: <b>" + String(dashHammerMode ? "ON" : "OFF") + "</b></span></div>";
+  s += "</div>";
   s += "<div class='card'><b>Display / Graph Settings</b><br><small>OLED bar + markers</small><hr>";
   s += "<form action='/setUi' method='post'>";
   s += "<div class='row'>Graph Mode: <select name='gm'>";
@@ -1592,6 +1749,42 @@ void setupRoutes() {
     server.sendHeader("Location", "/config");
     server.send(303);
   });
+
+  server.on("/setDash", HTTP_POST, []() {
+    dashTachEnabled = server.hasArg("dt_en");
+
+    if (server.hasArg("dt_ppr")) {
+      dashPulsesPerRev = constrain(server.arg("dt_ppr").toFloat(), 0.1f, 24.0f);
+    }
+    if (server.hasArg("dt_cal")) {
+      dashCalPct = constrain(server.arg("dt_cal").toInt(), 50, 150);
+    }
+
+    dashForceTest = server.hasArg("dt_ft");
+    if (server.hasArg("dt_fh")) {
+      dashForceHz = constrain(server.arg("dt_fh").toFloat(), 2.0f, 2000.0f);
+    }
+
+    if (server.hasArg("dt_pw")) {
+      dashPulseLowUs = (uint32_t)constrain(server.arg("dt_pw").toInt(), 150, 5000);
+    }
+
+    saveDashCfg();
+    server.sendHeader("Location", "/config");
+    server.send(303);
+  });
+
+  server.on("/dashHammer", HTTP_POST, []() {
+    if (server.hasArg("on"))  dashHammerMode = true;
+    if (server.hasArg("off")) dashHammerMode = false;
+    if (!dashHammerMode) {
+      // release line
+      digitalWrite(PIN_TACH_OUT, LOW);
+    }
+    server.sendHeader("Location", "/config");
+    server.send(303);
+  });
+
 
   server.on("/setUi", HTTP_POST, []() {
     int oldEdge = rpmEdgeMode;
@@ -2115,6 +2308,9 @@ analogReadResolution(12);
   pinMode(PIN_VR_RPM, INPUT);
   pinMode(PIN_VR_SPEED, INPUT);
 
+  dashTachInit();
+
+
   attachInterrupt(digitalPinToInterrupt(PIN_VR_RPM), isrRpm, (rpmEdgeMode==1) ? RISING : FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_VR_SPEED), isrSpeed, (rpmEdgeMode==1) ? RISING : FALLING);
   SPI.begin(OLED_SCK, -1, OLED_MOSI, OLED_CS);
@@ -2207,6 +2403,10 @@ void loop() {
   }
 
   rpmFiltered = (RPM_ALPHA * rpmNow) + ((1.0f - RPM_ALPHA) * rpmFiltered);
+
+  // Factory dash tacho output
+  dashTachService(rpmFiltered);
+
 
   if (rpmFiltered > maxRpmTrip) maxRpmTrip = rpmFiltered;
   if (rpmFiltered > maxRpmAll) {
