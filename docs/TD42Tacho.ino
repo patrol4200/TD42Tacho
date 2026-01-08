@@ -1270,7 +1270,17 @@ void routeDashboard() {
   s += "<form action='/resetTripKm' method='post'><button type='submit'>Reset Trip KM</button></form>";
   s += "</div>";
 
-  s += htmlFooter();
+  
+  // Dash hammer quick control (wiring test)
+  s += "<div class='card'><b>Dash Tach Output Test</b><br><small>HAMMER forces the output LOW continuously (runtime only). Use to confirm 2N7000 wiring.</small><hr>";
+  s += "<div class='row'><form method='post' action='/dashHammer' style='display:inline-block;margin-right:8px'>"
+       "<input type='hidden' name='on' value='1'><button class='btn' type='submit'>HAMMER ON</button></form>"
+       "<form method='post' action='/dashHammer' style='display:inline-block'>"
+       "<input type='hidden' name='off' value='1'><button class='btn' type='submit'>HAMMER OFF</button></form>"
+       "<span style='margin-left:10px'>State: <b>" + String(dashHammerMode ? "ON" : "OFF") + "</b></span></div>";
+  s += "<div class='row'><small>If HAMMER ON does not pull the dash line to ~0V, the MOSFET pins/ground/wire are wrong.</small></div>";
+  s += "</div>";
+s += htmlFooter();
   server.send(200, "text/html", s);
 }
 
